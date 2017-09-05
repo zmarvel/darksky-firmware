@@ -116,8 +116,11 @@ CSRC = $(STARTUPSRC) \
        $(STREAMSSRC) \
        $(SHELLSRC) \
        $(CHIBIOS)/os/various/syscalls.c \
-       src/main.c \
-       src/tsl2561.c
+       src/stm32l4xx_hal_flash.c \
+       src/stm32l4xx_hal_flash_ex.c \
+       src/stm32l4xx_hal_flash_ramfunc.c \
+       src/tsl2561.c \
+       src/main.c
 
 # C++ sources that can be compiled in ARM or THUMB mode depending on the global
 # setting.

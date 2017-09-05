@@ -23,17 +23,50 @@
 #include "shell.h"
 #include "chprintf.h"
 #include "tsl2561.h"
+#include "stm32l4xx_hal_flash.h"
+#include "stm32l4xx_hal_flash_ex.h"
 
+
+/*
+ * - Reset: System initialization not yet complete.
+ * - Idle: System init complete, waiting for trigger.
+ * - Triggered: User button pressed, set up sensor for data collection,
+ *   interrupts.
+ * - Running: Collecting data and writing it to flash.
+ * - Finished: Flash is full or the target number of readings/experiment time
+ *   has been achieved.
+ */
+
+enum experiment_state {
+  EXP_RESET,
+  EXP_IDLE,
+  EXP_TRIGGERED,
+  EXP_RUNNING,
+  EXP_FINISHED,
+};
+
+/*
+ * 2048 - sizeof(uint32_t)*4 = 2032
+ * 2032 / sizeof(struct tsl_reading) = 508
+ */
+#define MAX_PAGE (FLASH_BANK_SIZE / FLASH_PAGE_SIZE)
+#define MAX_READINGS_PER_PAGE 508
 
 struct tsl_reading {
-  uint32_t seconds;
-  uint32_t suseconds;
   uint16_t channel0;
   uint16_t channel1;
 };
 
+struct page_record {
+  uint32_t start_seconds, start_suseconds;
+  uint32_t end_seconds, end_suseconds;
+  struct tsl_reading readings[MAX_READINGS_PER_PAGE];
+};
 
-static bool tslReady = false;
+enum experiment_state sysState = EXP_RESET;
+struct page_record page;
+int readingsPos = 0;
+uint32_t *pagePos = NULL;
 static binary_semaphore_t tslSem;
 static void tslInit(void);
 
@@ -41,6 +74,88 @@ void rtcConvertDateTimeToTimestamp(RTCDateTime *dateTime, uint32_t *seconds, uin
   struct tm time;
   rtcConvertDateTimeToStructTm(dateTime, &time, ms);
   *seconds = mktime(&time);
+}
+
+
+/*
+ * Flash utility functions
+ */
+
+uint32_t *flashData = (uint32_t *)(FLASH_BASE + 0x80000);
+
+/*
+ * Erase `flash_data` so it can be written. Returns 0xffffffff on success.
+ */
+int flashEraseData(void) {
+  uint32_t pageerr;
+
+  /* If flashData spans two banks, erase them separately. */
+  FLASH_EraseInitTypeDef eraseinit = {
+    FLASH_TYPEERASE_PAGES,
+    FLASH_BANK_2,
+    0,
+    FLASH_BANK_SIZE / FLASH_PAGE_SIZE,
+  };
+  chSysLock();
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+  HAL_FLASHEx_Erase(&eraseinit, &pageerr);
+  HAL_FLASH_Lock();
+  chSysUnlock();
+
+  return pageerr;
+}
+
+int flashWritePage(uint32_t addr, uint8_t *data, uint32_t nbytes) {
+  int err, rc;
+
+  if (nbytes > FLASH_PAGE_SIZE) {
+    /* Only write one page */
+    nbytes = FLASH_PAGE_SIZE;
+  }
+
+  for (unsigned int i = 0; i < nbytes; i += 8) {
+    uint64_t dword = *((uint64_t *)&data[i]);
+    err = 0;
+    chSysLock();
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    rc = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr, dword);
+    if (rc != HAL_OK)
+      err = HAL_FLASH_GetError();
+    HAL_FLASH_Lock();
+    chSysUnlock();
+    if (err != 0)
+      return err;
+  }
+
+  return rc;
+}
+
+int flashFindNextEmptySlot(void) {
+  for (unsigned int i = 0; i < FLASH_BANK_SIZE / FLASH_PAGE_SIZE; i++) {
+    if (flashData[i*(FLASH_PAGE_SIZE/sizeof(uint32_t))] == 0xffffffff)
+      return i;
+  }
+
+  return -1;
+}
+
+/*
+ * Initialize flash.
+ *
+ * Check if it's already been initialized. If yes, find the next empty slot
+ * and return its index. If no, erase the flash page and fill the first slot
+ * with the magic value. Returns negative value on failure.
+ */
+int flashInit(void) {
+  if (flashData[0] != 0xffffffff)
+    return -1;
+  int empty = flashFindNextEmptySlot();
+  if (empty < 0)
+    return -1;
+  pagePos = &flashData[empty*(FLASH_PAGE_SIZE/sizeof(uint32_t))];
+  return 0;
 }
 
 
@@ -59,33 +174,104 @@ static THD_FUNCTION(Thread1, arg) {
     chThdSleepMilliseconds(500);
   }
 }
+
+static inline void reset(void) {
+  sysState = EXP_IDLE;
+}
+
+static inline void idle(void) {
+  if (palReadLine(LINE_BUTTON) == 0) {
+    sysState = EXP_TRIGGERED;
+  }
+}
+
+static inline void triggered(void) {
+  chprintf((BaseSequentialStream *)&SD2, "Triggered\r\n");
+
+  if (flashInit() < 0) {
+    chprintf((BaseSequentialStream *)&SD2, "flashInit failed\r\n");
+  }
+  chprintf((BaseSequentialStream *)&SD2, "initial pagePos: 0x%x\r\n", (uint32_t)pagePos);
+  chprintf((BaseSequentialStream *)&SD2, "flashData: 0x%x\r\n", (uint32_t)flashData);
+
+  tslInit();
+  
+  sysState = EXP_RUNNING;
+}
+
+static inline void running(void) {
+  if (pagePos == (flashData + MAX_PAGE*FLASH_PAGE_SIZE)) {
+    sysState = EXP_FINISHED;
+    return;
+  }
+
+  if (readingsPos == 0) {
+    RTCDateTime dateTime;
+    rtcGetTime(&RTCD1, &dateTime);
+    rtcConvertDateTimeToTimestamp(&dateTime, &page.start_seconds,
+                                  &page.start_suseconds);
+  }
+
+  if (readingsPos < MAX_READINGS_PER_PAGE) {
+    chBSemWait(&tslSem);
+    uint16_t chan0 = tsl2561_getChannel0();
+    uint16_t chan1 = tsl2561_getChannel1();
+    page.readings[readingsPos].channel0 = chan0;
+    page.readings[readingsPos].channel1 = chan1;
+    readingsPos += 1;
+    chprintf((BaseSequentialStream *)&SD2, "%u %u\r\n", chan0, chan1);
+    tsl2561_clearInterrupt();
+  } else {
+    if (pagePos != NULL) {
+      flashWritePage((uint32_t)pagePos, (uint8_t *)&page, sizeof(struct page_record));
+      pagePos += (FLASH_PAGE_SIZE / sizeof(uint32_t));
+      chprintf((BaseSequentialStream *)&SD2, "Wrote to page %u\r\n",
+               ((uint32_t)pagePos - FLASH_BASE) / (FLASH_PAGE_SIZE / sizeof(uint32_t)));
+      readingsPos = 0;
+    }
+  }
+
+  if (readingsPos == (MAX_READINGS_PER_PAGE)) {
+    RTCDateTime dateTime;
+    rtcGetTime(&RTCD1, &dateTime);
+    rtcConvertDateTimeToTimestamp(&dateTime, &page.end_seconds,
+                                  &page.end_suseconds);
+  }
+}
+
+static inline void finished(void) {
+  chprintf((BaseSequentialStream *)&SD2, "Finished\r\n");
+}
+
 /*
  * Light sensor reader thread.
  */
-static struct tsl_reading readings[166];
-static int readingsPos = 0;
-static THD_WORKING_AREA(waThread2, 128);
+static THD_WORKING_AREA(waThread2, 256);
 static THD_FUNCTION(Thread2, arg) {
 
   (void)arg;
   chRegSetThreadName("reader");
-  RTCDateTime dateTime;
-  struct tsl_reading *reading;
   while (true) {
-    if (tslReady && readingsPos < 166) {
-      chBSemWait(&tslSem);
-      reading = &readings[readingsPos];
-      rtcGetTime(&RTCD1, &dateTime);
-      rtcConvertDateTimeToTimestamp(&dateTime, &reading->seconds,
-                                    &reading->suseconds);
-      reading->channel0 = tsl2561_getChannel0();
-      reading->channel1 = tsl2561_getChannel1();
-      readingsPos += 1;
-      chprintf((BaseSequentialStream *)&SD2, "%u %u\r\n", reading->channel0, reading->channel1);
-      tsl2561_clearInterrupt();
-    } else {
-      tslInit();
+    switch (sysState) {
+      case EXP_RESET:
+        reset();
+        break;
+      case EXP_IDLE:
+        idle();
+        break;
+      case EXP_TRIGGERED:
+        triggered();
+        break;
+      case EXP_RUNNING:
+        running();
+        break;
+      case EXP_FINISHED:
+        finished();
+        break;
+      default:
+        break;
     }
+
     chThdSleepMilliseconds(1);
   }
 }
@@ -96,7 +282,7 @@ static THD_FUNCTION(Thread2, arg) {
 static void tslHandler(EXTDriver *extp, expchannel_t channel) {
   (void)extp;
   (void)channel;
-  if (tslReady) {
+  if (sysState == EXP_RUNNING) {
     chBSemSignalI(&tslSem);
   }
 }
@@ -159,7 +345,6 @@ static void tslInit(void) {
   palSetLineMode(LINE_ARD_A3, PAL_MODE_INPUT_PULLUP);
 
   tsl2561_setInterrupt(TSL2561_INTMODE_LEVEL, 0);
-  tslReady = true;
 }
 
 
@@ -258,10 +443,41 @@ static void cmd_tsl(BaseSequentialStream *chp, int argc, char *argv[]) {
 }
 
 
+static const char *flash_usage = "flash <command>\r\n"
+"command:\r\n"
+"\terase\r\n"
+"\tempty\r\n"
+"\tdump\r\n";
+static void cmd_flash(BaseSequentialStream *chp, int argc, char *argv[]) {
+  if (argc < 1) {
+    chprintf(chp, flash_usage);
+    return;
+  }
+
+  if (strcmp("erase", argv[0]) == 0) {
+    flashEraseData();
+  } else if (strcmp("empty", argv[0]) == 0) {
+    int empty = flashFindNextEmptySlot();
+    chprintf(chp, "empty: ");
+    if (empty < 0) {
+      chprintf(chp, "none");
+    } else {
+      chprintf(chp, "%d", empty);
+    }
+    chprintf(chp, "\r\n");
+  } else if (strcmp("dump", argv[0]) == 0) {
+    for (uint32_t *page = flashData; page < pagePos; page += (FLASH_PAGE_SIZE/sizeof(uint32_t))) {
+    }
+  } else {
+  }
+}
+
+
 #define SHELL_WA_SIZE THD_WORKING_AREA_SIZE(2048)
 
 static const ShellCommand commands[] = {
   {"tsl", cmd_tsl},
+  {"flash", cmd_flash},
   {NULL, NULL},
 };
 
@@ -313,6 +529,7 @@ int main(void) {
    * Creates the blinker thread.
    */
   chThdCreateStatic(waThread1, sizeof(waThread1), NORMALPRIO, Thread1, NULL);
+
   chThdCreateStatic(waThread2, sizeof(waThread2), NORMALPRIO+1, Thread2, NULL);
 
   /*
