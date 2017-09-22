@@ -442,7 +442,6 @@ static void cmd_tsl(BaseSequentialStream *chp, int argc, char *argv[]) {
   }
 }
 
-
 static const char *flash_usage = "flash <command>\r\n"
 "command:\r\n"
 "\terase\r\n"
@@ -469,7 +468,25 @@ static void cmd_flash(BaseSequentialStream *chp, int argc, char *argv[]) {
     for (uint32_t *page = flashData; page < pagePos; page += (FLASH_PAGE_SIZE/sizeof(uint32_t))) {
     }
   } else {
+    chprintf(chp, flash_usage);
   }
+}
+
+//static const char *tsl237_usage = "tsl237";
+static void cmd_tsl237(BaseSequentialStream *chp, int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+  systime_t start = chVTGetSystemTime();
+  systime_t end = start + MS2ST(100);
+  uint32_t ticks = 0, count = 0;
+  while (chVTIsSystemTimeWithin(start, end)) {
+    icuStartCapture(&ICUD1);
+    icuWaitCapture(&ICUD1);
+    ticks += icuGetPeriodX(&ICUD1);
+    count++;
+  }
+  ticks /= count;
+  chprintf(chp, "count: %u, ticks: %u\r\n", count, ticks);
 }
 
 
@@ -478,6 +495,7 @@ static void cmd_flash(BaseSequentialStream *chp, int argc, char *argv[]) {
 static const ShellCommand commands[] = {
   {"tsl", cmd_tsl},
   {"flash", cmd_flash},
+  {"tsl237", cmd_tsl237},
   {NULL, NULL},
 };
 
@@ -486,7 +504,6 @@ static const ShellConfig shellcfg = {
   commands,
 };
 
-
 static const I2CConfig i2ccfg = {
   .timingr = STM32_TIMINGR_PRESC(16)
     | STM32_TIMINGR_SCLDEL(15) | STM32_TIMINGR_SDADEL(15)
@@ -494,6 +511,20 @@ static const I2CConfig i2ccfg = {
   .cr1 = 0,
   .cr2 = 0,
 };
+
+/* In mcuconf.h, STM32_ICU_USE_TIM1 is TRUE.
+ * TSL237 min/max freq: 500/1000 kHz
+ * TIM1CH2 = PA9 AF1
+ */
+static const ICUConfig icucfg = {
+  .mode = ICU_INPUT_ACTIVE_LOW,
+  .frequency = 2000000,
+  .width_cb = NULL,
+  .period_cb = NULL,
+  .overflow_cb = NULL,
+  .channel = ICU_CHANNEL_2
+};
+
 
 /*
  * Application entry point.
@@ -524,6 +555,10 @@ int main(void) {
 
   extStart(&EXTD1, &extcfg);
   shellInit();
+
+  /* PA9 AF1 */
+  palSetLineMode(LINE_ARD_D8, PAL_MODE_ALTERNATE(1));
+  icuStart(&ICUD1, &icucfg);
 
   /*
    * Creates the blinker thread.
